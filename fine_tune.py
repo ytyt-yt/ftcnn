@@ -113,7 +113,7 @@ if __name__ == '__main__':
     parser.add_argument("-name", help="project name")
     parser.add_argument("-optim", default="adam", help="optimizer")
     parser.add_argument("-batch_size", type=int, default=32, help="batch size")
-    parser.add_argument("-epochs", default=50, help="num of epochs")
+    parser.add_argument("-epochs", type=int, default=50, help="num of epochs")
 
     args = parser.parse_args()
 
