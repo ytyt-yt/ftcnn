@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from keras import backend as K
@@ -13,6 +14,11 @@ class TensorBoardWithLR(TensorBoard):
         super().on_epoch_end(epoch, logs)
 
 
+def infer_args_from_weights_path(wpath):
+    [basenet, _, batch_size, _] = wpath.split('/')[-4:]
+    return basenet, int(batch_size)
+
+
 class FTCNN(object):
 
     def __init__(self, basenet="xception"):
@@ -24,25 +30,29 @@ class FTCNN(object):
 
         self.n_classes = None
 
-    def _get_generator(self, img_dir, batch_size):
+    def _get_generator(self, img_dir, batch_size, test_mode=False):
         datagen = ImageDataGenerator(
             preprocessing_function=self.preprocess_func,
         )
+        if test_mode:
+            class_mode = None
+        else:
+            class_mode = 'categorical'
+
         gen = datagen.flow_from_directory(
             str(img_dir),
             target_size=self.img_target_size,
             batch_size=batch_size,
-            class_mode='categorical',
+            class_mode=class_mode,
         )
         return gen
-
-    def _get_classes(self, img_dir):
-        return set([f.name for f in img_dir.iterdir() if f.is_dir()])
 
     def _get_ckpt_cb(self):
         ckpt_dir = self.run_dir / 'ckpt' / self.project_name / \
                 self.basenet / self.optim / str(self.batch_size)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.ckpt_dir = ckpt_dir
+
         ckpt_file = ckpt_dir / \
             'weights.ep{epoch:02d}' \
             '-{val_acc:.2f}' \
@@ -73,17 +83,20 @@ class FTCNN(object):
 
         self.optim = optim
 
-        train_classes = self._get_classes(self.train_root)
-        val_classes = self._get_classes(self.val_root)
-        print(train_classes, val_classes)
-        assert train_classes == val_classes
-
         self.batch_size = batch_size
         train_gen = self._get_generator(self.train_root, batch_size)
         val_gen = self._get_generator(self.val_root, batch_size)
+        assert train_gen.class_indices == val_gen.class_indices
+        cls2id = dict([(v, k) for (k, v) in train_gen.class_indices.items()])
+        print(cls2id)
+        print(train_gen.class_indices)
 
-        self.n_classes = len(train_classes)
+        self.n_classes = len(train_gen.class_indices)
         print('class #: %d' % self.n_classes)
+
+        self.mckpt = self._get_ckpt_cb()
+        self.tb = self._get_tensorboard_cb()
+        json.dump(cls2id, (self.ckpt_dir / 'id2class.json').open('w'))
 
         self.model = nets.get_model(
             self.n_classes,
@@ -91,15 +104,35 @@ class FTCNN(object):
             optim=self.optim,
         )
 
-        self.mckpt = self._get_ckpt_cb()
-        self.tb = self._get_tensorboard_cb()
-
         self.model.fit_generator(
             train_gen,
             validation_data=val_gen,
             epochs=epochs,
             callbacks=[self.mckpt, self.tb]
         )
+
+    def predict(self, weights_path, test_root, batch_size, top=3):
+
+        cls_json = Path(weights_path).parent / 'id2class.json'
+        id2cls = json.load(cls_json.open())
+        self.n_classes = len(id2cls)
+
+        self.model = nets.get_model(
+            self.n_classes,
+            basenet=self.basenet,
+        )
+        self.model.load_weights(weights_path)
+
+        test_gen = self._get_generator(test_root, batch_size, test_mode=True)
+        res = self.model.predict_generator(test_gen)
+        for e, fn in zip(res, test_gen.filenames):
+            idices = e.argsort()[::-1][:top]
+            lbls = [(id2cls[str(i)], e[i]) for i in idices]
+            lbls.sort(key=lambda x: x[1], reverse=True)
+            print(fn)
+            for l in lbls:
+                print('%s[%.2f]' % l)
+        return res
 
 
 if __name__ == '__main__':
@@ -115,14 +148,22 @@ if __name__ == '__main__':
     parser.add_argument("-batch_size", type=int, default=32, help="batch size")
     parser.add_argument("-epochs", type=int, default=50, help="num of epochs")
 
+    parser.add_argument("-test_root", default=None, help="test images root")
+    parser.add_argument("-weights", help="weights path")
+
     args = parser.parse_args()
 
-    ftcnn = FTCNN(args.basenet)
-    ftcnn.train(
-            args.dataset,
-            run_dir=args.run_dir,
-            project_name=args.name,
-            optim=args.optim,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            )
+    if not args.test_root:
+        ftcnn = FTCNN(args.basenet)
+        ftcnn.train(
+                args.dataset,
+                run_dir=args.run_dir,
+                project_name=args.name,
+                optim=args.optim,
+                batch_size=args.batch_size,
+                epochs=args.epochs,
+                )
+    else:
+        basenet, batch_size = infer_args_from_weights_path(args.weights)
+        ftcnn = FTCNN(basenet)
+        ftcnn.predict(args.weights, args.test_root, batch_size)
